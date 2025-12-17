@@ -15,7 +15,7 @@ from hybrid_recommendation import (
     hybrid_recommend_for_book,
     hybrid_recommend_for_favorites,
 )
-from model_evaluation import calculate_metrics, EvaluationResult
+from model_evaluation import EvaluationResult, load_evaluation_result
 
 # --- CẤU HÌNH TRANG WEB ---
 st.set_page_config(
@@ -43,6 +43,20 @@ st.markdown("""
 # ==========================================
 USER_DATA_FILE = 'user_favorites.json'
 USER_HISTORY_FILE = 'user_history.json'
+EVALUATION_RESULTS_FILE = "evaluation_results.json"
+
+
+@st.cache_data
+def load_evaluation_results_from_disk(path: str = EVALUATION_RESULTS_FILE) -> tuple[EvaluationResult | None, dict | None]:
+    """Load offline evaluation results computed by running model_evaluation.py separately."""
+    if not os.path.exists(path):
+        return None, None
+    try:
+        result, payload = load_evaluation_result(path)
+        return result, payload
+    except Exception as e:
+        # Keep app running even if JSON is corrupted/missing fields
+        return EvaluationResult(None, None, None, None, None, error=f"Lỗi đọc {path}: {e}"), None
 
 def load_favorites_from_disk():
     if os.path.exists(USER_DATA_FILE):
@@ -300,6 +314,27 @@ with st.sidebar:
         "📈 Đánh giá Mô hình"
     ])
     st.divider()
+
+    # Show offline evaluation metrics summary (if available)
+    eval_result, eval_payload = load_evaluation_results_from_disk()
+    if eval_result is not None:
+        st.subheader("📌 Metrics (offline)")
+        if eval_result.error:
+            st.warning(eval_result.error)
+        else:
+            created_at = None
+            if isinstance(eval_payload, dict):
+                created_at = eval_payload.get("created_at")
+            if created_at:
+                st.caption(f"Lần chạy gần nhất: {created_at}")
+            c_m1, c_m2 = st.columns(2)
+            with c_m1:
+                st.metric("RMSE", f"{eval_result.rmse:.4f}" if eval_result.rmse is not None else "N/A")
+                st.metric("Precision@10", f"{(eval_result.precision_at_k or 0.0) * 100:.2f}%")
+            with c_m2:
+                st.metric("MAE", f"{eval_result.mae:.4f}" if eval_result.mae is not None else "N/A")
+                st.metric("Recall@10", f"{(eval_result.recall_at_k or 0.0) * 100:.2f}%")
+        st.divider()
 
     if page == "🏠 Trang chủ":
         st.header("🔍 Cấu hình gợi ý")
@@ -707,22 +742,13 @@ elif page == "📈 Đánh giá Mô hình":
     **Lưu ý:** Dữ liệu đánh giá được lấy từ dataset công khai (Goodreads/MovieLens), 
     không phải từ người dùng thực tế của hệ thống. Đây là cách tiếp cận phổ biến cho dự án học tập và demo.
     """)
-    
-    @st.cache_data
-    def calculate_metrics_cached() -> EvaluationResult:
-        return calculate_metrics(
-            ratings_path="ratings.csv",
-            k=10,
-            relevant_threshold=4,
-            max_users=1000,
-            test_size=0.2,
-            random_state=42,
-            n_components=50,
-        )
-    
-    # Tính toán và hiển thị metrics
-    with st.spinner("Đang tính toán metrics..."):
-        metrics = calculate_metrics_cached()
+
+    # Load offline metrics (computed by running model_evaluation.py separately)
+    metrics, payload = load_evaluation_results_from_disk()
+    if metrics is None:
+        st.warning("Chưa có kết quả đánh giá. Hãy chạy `model_evaluation.py` trước để tạo `evaluation_results.json`.")
+        st.code("python model_evaluation.py --ratings ratings.csv --output evaluation_results.json", language="bash")
+        st.stop()
     
     if metrics.rmse is None:
         st.error("❌ Không thể tính toán metrics. Vui lòng kiểm tra file 'ratings.csv'.")
@@ -738,6 +764,8 @@ elif page == "📈 Đánh giá Mô hình":
             metrics.recall_at_k,
             metrics.test_size,
         )
+        if isinstance(payload, dict) and payload.get("created_at"):
+            st.caption(f"Kết quả lấy từ file `{EVALUATION_RESULTS_FILE}` • Lần chạy: {payload.get('created_at')}")
         # Hiển thị thông tin dataset
         st.subheader("📊 Thông tin Dataset")
         col_info1, col_info2, col_info3 = st.columns(3)

@@ -1,4 +1,7 @@
 import math
+import argparse
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +19,32 @@ class EvaluationResult:
     recall_at_k: float | None
     test_size: int | None
     error: str | None = None
+    note: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "rmse": self.rmse,
+            "mae": self.mae,
+            "precision_at_k": self.precision_at_k,
+            "recall_at_k": self.recall_at_k,
+            "test_size": self.test_size,
+            "error": self.error,
+            "note": self.note,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "EvaluationResult":
+        if d is None:
+            return EvaluationResult(None, None, None, None, None, error="Empty evaluation result")
+        return EvaluationResult(
+            rmse=d.get("rmse"),
+            mae=d.get("mae"),
+            precision_at_k=d.get("precision_at_k"),
+            recall_at_k=d.get("recall_at_k"),
+            test_size=d.get("test_size"),
+            error=d.get("error"),
+            note=d.get("note"),
+        )
 
 
 def _precision_at_k(actual_set: set, predicted_list: list, k: int = 10) -> float:
@@ -41,6 +70,8 @@ def calculate_metrics(
     k: int = 10,
     relevant_threshold: int = 4,
     max_users: int = 1000,
+    max_train_users: int | None = 4000,
+    max_train_items: int | None = 4000,
     test_size: float = 0.2,
     random_state: int = 42,
     n_components: int = 50,
@@ -67,6 +98,31 @@ def calculate_metrics(
         return EvaluationResult(None, None, None, None, None, error="ratings.csv thiếu cột userId/bookId/rating")
 
     try:
+        # === Downsample to keep pivot matrix feasible ===
+        unique_users_before = int(ratings_eval["userId"].nunique())
+        unique_items_before = int(ratings_eval["bookId"].nunique())
+
+        note_parts: list[str] = []
+
+        if isinstance(max_train_users, int) and max_train_users > 0 and unique_users_before > max_train_users:
+            top_users = ratings_eval["userId"].value_counts().head(max_train_users).index
+            ratings_eval = ratings_eval[ratings_eval["userId"].isin(top_users)]
+            note_parts.append(f"Giới hạn top {max_train_users} users theo số rating để tránh OOM.")
+
+        if isinstance(max_train_items, int) and max_train_items > 0:
+            unique_items_mid = int(ratings_eval["bookId"].nunique())
+            if unique_items_mid > max_train_items:
+                top_items = ratings_eval["bookId"].value_counts().head(max_train_items).index
+                ratings_eval = ratings_eval[ratings_eval["bookId"].isin(top_items)]
+                note_parts.append(f"Giới hạn top {max_train_items} items theo số rating để tránh OOM.")
+
+        # If we filtered, record a note for UI
+        unique_users_after = int(ratings_eval["userId"].nunique())
+        unique_items_after = int(ratings_eval["bookId"].nunique())
+        if note_parts:
+            note_parts.append(f"Users: {unique_users_after:,}/{unique_users_before:,}, Items: {unique_items_after:,}/{unique_items_before:,}.")
+        note = " ".join(note_parts) if note_parts else None
+
         train_data, test_data = train_test_split(ratings_eval, test_size=test_size, random_state=random_state)
         if train_data.empty or test_data.empty:
             return EvaluationResult(None, None, None, None, None, error="Train/Test split bị rỗng")
@@ -152,9 +208,80 @@ def calculate_metrics(
         avg_precision = float(np.mean(precision_scores)) if precision_scores else 0.0
         avg_recall = float(np.mean(recall_scores)) if recall_scores else 0.0
 
-        return EvaluationResult(rmse_test, mae_test, avg_precision, avg_recall, int(len(test_data)))
+        return EvaluationResult(rmse_test, mae_test, avg_precision, avg_recall, int(len(test_data)), note=note)
 
     except Exception as e:
         return EvaluationResult(None, None, None, None, None, error=str(e))
+
+
+def save_evaluation_result(result: EvaluationResult, output_path: str, meta: dict | None = None) -> None:
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "meta": meta or {},
+        "result": result.to_dict(),
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_evaluation_result(input_path: str) -> tuple[EvaluationResult, dict]:
+    with open(input_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    res = payload.get("result", {}) if isinstance(payload, dict) else {}
+    return EvaluationResult.from_dict(res), payload if isinstance(payload, dict) else {"meta": meta, "result": res}
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Evaluate recommender model from ratings.csv and export metrics to JSON.")
+    p.add_argument("--ratings", default="ratings.csv", help="Path to ratings CSV (needs userId, bookId, rating).")
+    p.add_argument("--output", default="evaluation_results.json", help="Output JSON file path.")
+    p.add_argument("--k", type=int, default=10, help="K for Precision@K / Recall@K.")
+    p.add_argument("--relevant-threshold", type=int, default=4, help="Relevant if rating >= threshold.")
+    p.add_argument("--max-users", type=int, default=1000, help="Max users to evaluate for ranking metrics.")
+    p.add_argument("--max-train-users", type=int, default=4000, help="Max users used to build train pivot (anti-OOM). Use 0 to disable.")
+    p.add_argument("--max-train-items", type=int, default=4000, help="Max items used to build train pivot (anti-OOM). Use 0 to disable.")
+    p.add_argument("--test-size", type=float, default=0.2, help="Test split ratio.")
+    p.add_argument("--random-state", type=int, default=42, help="Random seed.")
+    p.add_argument("--n-components", type=int, default=50, help="SVD components.")
+    return p
+
+
+if __name__ == "__main__":
+    args = _build_arg_parser().parse_args()
+    metrics = calculate_metrics(
+        ratings_path=args.ratings,
+        k=args.k,
+        relevant_threshold=args.relevant_threshold,
+        max_users=args.max_users,
+        max_train_users=(None if args.max_train_users == 0 else args.max_train_users),
+        max_train_items=(None if args.max_train_items == 0 else args.max_train_items),
+        test_size=args.test_size,
+        random_state=args.random_state,
+        n_components=args.n_components,
+    )
+    save_evaluation_result(
+        metrics,
+        args.output,
+        meta={
+            "ratings_path": args.ratings,
+            "k": args.k,
+            "relevant_threshold": args.relevant_threshold,
+            "max_users": args.max_users,
+            "max_train_users": (None if args.max_train_users == 0 else args.max_train_users),
+            "max_train_items": (None if args.max_train_items == 0 else args.max_train_items),
+            "test_size": args.test_size,
+            "random_state": args.random_state,
+            "n_components": args.n_components,
+        },
+    )
+    if metrics.error:
+        print(f"[ERROR] Evaluation failed: {metrics.error}")
+    else:
+        print(
+            "[OK] Saved evaluation results to "
+            f"{args.output}: RMSE={metrics.rmse:.4f}, MAE={metrics.mae:.4f}, "
+            f"Precision@{args.k}={metrics.precision_at_k:.4f}, Recall@{args.k}={metrics.recall_at_k:.4f}"
+        )
 
 
