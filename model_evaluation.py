@@ -16,42 +16,6 @@ class EvaluationResult:
     recall_at_k: float | None
     test_size: int | None
     error: str | None = None
-    note: str | None = None
-
-
-def _maybe_reduce_ratings_for_matrix(
-    ratings: pd.DataFrame,
-    user_col: str = "userId",
-    item_col: str = "bookId",
-    max_cells: int = 20_000_000,
-    max_users: int = 4000,
-    max_items: int = 4000,
-) -> tuple[pd.DataFrame, str | None]:
-    """
-    Tránh tạo pivot_table quá lớn (dense) gây MemoryError.
-    Nếu (n_users * n_items) vượt ngưỡng max_cells thì lọc về top users/items theo số lượt rating.
-    """
-    n_users = int(ratings[user_col].nunique())
-    n_items = int(ratings[item_col].nunique())
-    cells = n_users * n_items
-    if cells <= max_cells:
-        return ratings, None
-
-    u_keep = min(max_users, n_users)
-    i_keep = min(max_items, n_items)
-
-    top_users = ratings[user_col].value_counts().head(u_keep).index
-    reduced = ratings[ratings[user_col].isin(top_users)]
-
-    top_items = reduced[item_col].value_counts().head(i_keep).index
-    reduced = reduced[reduced[item_col].isin(top_items)]
-
-    note = (
-        "Danh gia duoc tinh tren subset de tranh thieu RAM: "
-        f"{reduced[user_col].nunique():,} users x {reduced[item_col].nunique():,} books "
-        f"(tu {n_users:,} x {n_items:,})."
-    )
-    return reduced, note
 
 
 def _precision_at_k(actual_set: set, predicted_list: list, k: int = 10) -> float:
@@ -80,9 +44,6 @@ def calculate_metrics(
     test_size: float = 0.2,
     random_state: int = 42,
     n_components: int = 50,
-    max_cells: int = 20_000_000,
-    max_users_matrix: int = 4000,
-    max_items_matrix: int = 4000,
 ) -> EvaluationResult:
     """
     Tính RMSE, MAE, Precision@K, Recall@K từ ratings.csv theo kiểu hold-out:
@@ -106,22 +67,13 @@ def calculate_metrics(
         return EvaluationResult(None, None, None, None, None, error="ratings.csv thiếu cột userId/bookId/rating")
 
     try:
-        ratings_eval, note = _maybe_reduce_ratings_for_matrix(
-            ratings_eval,
-            user_col="userId",
-            item_col="bookId",
-            max_cells=max_cells,
-            max_users=max_users_matrix,
-            max_items=max_items_matrix,
-        )
-
         train_data, test_data = train_test_split(ratings_eval, test_size=test_size, random_state=random_state)
         if train_data.empty or test_data.empty:
-            return EvaluationResult(None, None, None, None, None, error="Train/Test split bị rỗng", note=note)
+            return EvaluationResult(None, None, None, None, None, error="Train/Test split bị rỗng")
 
         train_matrix = train_data.pivot_table(index="userId", columns="bookId", values="rating")
         if train_matrix.shape[0] == 0 or train_matrix.shape[1] == 0:
-            return EvaluationResult(None, None, None, None, None, error="Ma trận train rỗng", note=note)
+            return EvaluationResult(None, None, None, None, None, error="Ma trận train rỗng")
 
         # Mean centering + fillna(0) để SVD
         train_user_means = train_matrix.mean(axis=1)
@@ -131,7 +83,7 @@ def calculate_metrics(
         # SVD
         n_comp_eff = min(n_components, min(X_train.shape) - 1) if min(X_train.shape) > 1 else 1
         if n_comp_eff < 1:
-            return EvaluationResult(None, None, None, None, None, error="Không đủ dữ liệu để train SVD", note=note)
+            return EvaluationResult(None, None, None, None, None, error="Không đủ dữ liệu để train SVD")
 
         svd = TruncatedSVD(n_components=n_comp_eff, random_state=random_state)
         X_train_transformed = svd.fit_transform(X_train)
@@ -155,15 +107,7 @@ def calculate_metrics(
                 test_actuals.append(float(actual_rating))
 
         if not test_predictions:
-            return EvaluationResult(
-                None,
-                None,
-                None,
-                None,
-                len(test_data),
-                error="Không có sample test nào khớp train để tính RMSE/MAE",
-                note=note,
-            )
+            return EvaluationResult(None, None, None, None, len(test_data), error="Không có sample test nào khớp train để tính RMSE/MAE")
 
         rmse_test = math.sqrt(mean_squared_error(test_actuals, test_predictions))
         mae_test = mean_absolute_error(test_actuals, test_predictions)
@@ -208,7 +152,7 @@ def calculate_metrics(
         avg_precision = float(np.mean(precision_scores)) if precision_scores else 0.0
         avg_recall = float(np.mean(recall_scores)) if recall_scores else 0.0
 
-        return EvaluationResult(rmse_test, mae_test, avg_precision, avg_recall, int(len(test_data)), note=note)
+        return EvaluationResult(rmse_test, mae_test, avg_precision, avg_recall, int(len(test_data)))
 
     except Exception as e:
         return EvaluationResult(None, None, None, None, None, error=str(e))

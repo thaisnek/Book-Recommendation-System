@@ -127,7 +127,7 @@ def load_data():
 
 @st.cache_resource
 def train_models(books, ratings):
-    # Content-Based: luôn dùng TF-IDF (không dùng bert_embeddings.npy)
+    # Content-Based: chỉ dùng TF-IDF (không dùng bert_embeddings.npy)
     tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
     tfidf_matrix = tfidf.fit_transform(books['text_features'])
     cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
@@ -332,7 +332,7 @@ if page == "🏠 Trang chủ":
                     favorites_list=fav_list,
                     books=books,
                     cosine_sim=cosine_sim,
-                    user_book_matrix=user_book_matrix,
+                    user_book_matrix=user_book_matrix, 
                     corr_mat=corr_mat,
                     genre=selected_genre,
                     top_n=12,
