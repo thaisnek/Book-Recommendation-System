@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from sklearn.metrics.pairwise import linear_kernel
 
 
 def filter_by_genre(books_df: pd.DataFrame, genre: str | None) -> pd.DataFrame:
@@ -25,130 +26,127 @@ def filter_by_genre(books_df: pd.DataFrame, genre: str | None) -> pd.DataFrame:
     return books_df[books_df["genre"].apply(genre_match)]
 
 
-def _content_recs_for_book(
-    book_title: str,
-    books: pd.DataFrame,
-    cosine_sim: np.ndarray,
-    top_k: int = 30,
-) -> pd.DataFrame:
-    """Content-based (cosine similarity) cho 1 cuốn sách."""
+def _get_idx_for_title(books: pd.DataFrame, book_title: str) -> int | None:
     if books is None or books.empty:
-        return pd.DataFrame()
+        return None
     if not isinstance(book_title, str) or not book_title.strip():
-        return pd.DataFrame()
-
+        return None
     idx_list = books.index[books["title"] == book_title].tolist()
-    if not idx_list:
-        # thử tìm gần đúng
-        matches = books[books["title"].astype(str).str.contains(book_title, case=False, na=False)]
-        if matches.empty:
-            return pd.DataFrame()
-        idx_list = [matches.index[0]]
-
-    idx = idx_list[0]
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1 : top_k + 1]
-
-    recs = pd.DataFrame(
-        {
-            "title": [books.iloc[i]["title"] for i, _ in sim_scores],
-            "similarity_score": [float(s) for _, s in sim_scores],
-        }
-    )
-    return recs
+    if idx_list:
+        return int(idx_list[0])
+    matches = books[books["title"].astype(str).str.contains(book_title, case=False, na=False)]
+    if matches.empty:
+        return None
+    return int(matches.index[0])
 
 
-def _collab_recs_for_book(
-    book_title: str,
-    books: pd.DataFrame,
-    user_book_matrix: pd.DataFrame | None,
-    corr_mat: np.ndarray | None,
-    top_k: int = 30,
-) -> pd.DataFrame:
-    """Collaborative (corr matrix từ SVD) cho 1 cuốn sách."""
-    if user_book_matrix is None or corr_mat is None:
-        return pd.DataFrame()
-    if books is None or books.empty:
-        return pd.DataFrame()
-    if not isinstance(book_title, str) or not book_title.strip():
-        return pd.DataFrame()
+def _content_scores_for_idx(
+    idx: int,
+    tfidf_matrix,
+) -> np.ndarray:
+    # tfidf_matrix: sparse (n_books x n_features)
+    scores = linear_kernel(tfidf_matrix[idx], tfidf_matrix).ravel()
+    return scores.astype(np.float32, copy=False)
 
-    book_matches = books[books["title"] == book_title]
-    if book_matches.empty:
-        book_matches = books[books["title"].astype(str).str.contains(book_title, case=False, na=False)]
-        if book_matches.empty:
-            return pd.DataFrame()
 
-    book_id = book_matches.iloc[0].get("book_id", book_matches.iloc[0].get("movieId"))
-    if book_id not in user_book_matrix.columns:
-        return pd.DataFrame()
+def _normalize_rows(x: np.ndarray) -> np.ndarray:
+    if x is None:
+        return x
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return x / norms
 
-    col_idx = user_book_matrix.columns.get_loc(book_id)
-    corr_specific = corr_mat[col_idx]
 
-    result = pd.DataFrame({"corr_score": corr_specific})
-    result["bookId"] = user_book_matrix.columns
+def _collab_scores_for_book_id(
+    book_id: int,
+    collab_book_ids: np.ndarray | None,
+    collab_item_factors: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Return (book_ids, scores) for collaborative similarity.
+    collab_item_factors is expected to be row-normalized (cosine via dot product).
+    """
+    if collab_book_ids is None or collab_item_factors is None:
+        return None
+    if len(collab_book_ids) == 0 or collab_item_factors.size == 0:
+        return None
 
-    # map bookId -> title
-    merged = pd.merge(
-        result,
-        books[["book_id", "title"]],
-        left_on="bookId",
-        right_on="book_id",
-        how="inner",
-    )
+    id_to_pos = {int(b): i for i, b in enumerate(collab_book_ids)}
+    pos = id_to_pos.get(int(book_id))
+    if pos is None:
+        return None
 
-    merged = merged.sort_values("corr_score", ascending=False).iloc[1 : top_k + 1]
-    return merged[["title", "corr_score"]].copy()
+    v = collab_item_factors[pos]
+    sims = (collab_item_factors @ v).astype(np.float32, copy=False)  # [-1, 1]
+    sims[pos] = -np.inf
+    return collab_book_ids, sims
 
 
 def hybrid_recommend_for_book(
     book_title: str,
     books: pd.DataFrame,
-    cosine_sim: np.ndarray,
-    user_book_matrix: pd.DataFrame | None = None,
-    corr_mat: np.ndarray | None = None,
+    tfidf_matrix,
+    collab_book_ids: np.ndarray | None = None,
+    collab_item_factors: np.ndarray | None = None,
     genre: str | None = "Tất cả",
     top_n: int = 10,
     content_weight: float = 0.6,
     collab_weight: float = 0.4,
 ) -> pd.DataFrame:
-    """Hybrid Recommendation (Content + Collaborative) cho 1 cuốn sách."""
-    top_k = max(30, top_n * 3)
-    content = _content_recs_for_book(book_title, books, cosine_sim, top_k=top_k)
-    collab = _collab_recs_for_book(book_title, books, user_book_matrix, corr_mat, top_k=top_k)
-
-    if content.empty and collab.empty:
+    """Hybrid Recommendation (Content + Collaborative) cho 1 cuốn sách (memory-friendly)."""
+    if books is None or books.empty:
+        return pd.DataFrame()
+    idx = _get_idx_for_title(books, book_title)
+    if idx is None:
         return pd.DataFrame()
 
-    # chuẩn hóa & kết hợp
-    scores: dict[str, float] = {}
+    top_k = max(50, top_n * 5)
 
-    for _, row in content.iterrows():
-        t = row["title"]
-        if t == book_title:
-            continue
-        s = float(row.get("similarity_score", 0.0))
-        s = max(0.0, min(1.0, s))
-        scores[t] = scores.get(t, 0.0) + content_weight * s
+    # ===== Content =====
+    content_scores = _content_scores_for_idx(idx, tfidf_matrix)
+    content_scores[idx] = -np.inf
+    k_eff = min(top_k, content_scores.shape[0])
+    top_idx = np.argpartition(content_scores, -k_eff)[-k_eff:]
+    top_idx = top_idx[np.argsort(content_scores[top_idx])[::-1]]
 
-    for _, row in collab.iterrows():
-        t = row["title"]
-        if t == book_title:
+    # ===== Collaborative =====
+    book_id = books.loc[idx].get("book_id", books.loc[idx].get("movieId", None))
+    collab_pack = _collab_scores_for_book_id(book_id, collab_book_ids, collab_item_factors)
+
+    # Combine (by books row index)
+    scores: dict[int, float] = {}
+
+    for i in top_idx:
+        if int(i) == int(idx):
             continue
-        raw = float(row.get("corr_score", 0.0))
-        s = (raw + 1.0) / 2.0
+        s = float(content_scores[i])
         s = max(0.0, min(1.0, s))
-        scores[t] = scores.get(t, 0.0) + collab_weight * s
+        scores[int(i)] = scores.get(int(i), 0.0) + content_weight * s
+
+    if collab_pack is not None and "book_id" in books.columns:
+        all_book_ids, collab_scores = collab_pack
+        # map book_id -> books row index
+        bid_to_row = pd.Series(books.index, index=books["book_id"]).to_dict()
+        k2 = min(top_k, collab_scores.shape[0])
+        top_j = np.argpartition(collab_scores, -k2)[-k2:]
+        top_j = top_j[np.argsort(collab_scores[top_j])[::-1]]
+        for j in top_j:
+            bid = int(all_book_ids[j])
+            row_idx = bid_to_row.get(bid)
+            if row_idx is None or int(row_idx) == int(idx):
+                continue
+            raw = float(collab_scores[j])  # [-1,1]
+            s = (raw + 1.0) / 2.0
+            s = max(0.0, min(1.0, s))
+            scores[int(row_idx)] = scores.get(int(row_idx), 0.0) + collab_weight * s
 
     if not scores:
         return pd.DataFrame()
 
-    score_df = pd.DataFrame({"title": list(scores.keys()), "hybrid_score": list(scores.values())})
+    score_df = pd.DataFrame({"_row_idx": list(scores.keys()), "hybrid_score": list(scores.values())})
     score_df = score_df.sort_values("hybrid_score", ascending=False).head(top_n)
-
-    # trả về đầy đủ metadata sách để UI dùng
-    out = pd.merge(score_df, books, on="title", how="left")
+    out = books.loc[score_df["_row_idx"].values].copy()
+    out["hybrid_score"] = score_df["hybrid_score"].values
     out = filter_by_genre(out, genre)
     return out.head(top_n)
 
@@ -156,9 +154,9 @@ def hybrid_recommend_for_book(
 def hybrid_recommend_for_favorites(
     favorites_list: list[str],
     books: pd.DataFrame,
-    cosine_sim: np.ndarray,
-    user_book_matrix: pd.DataFrame | None = None,
-    corr_mat: np.ndarray | None = None,
+    tfidf_matrix,
+    collab_book_ids: np.ndarray | None = None,
+    collab_item_factors: np.ndarray | None = None,
     genre: str | None = "Tất cả",
     top_n: int = 12,
     content_weight: float = 0.6,
@@ -170,60 +168,71 @@ def hybrid_recommend_for_favorites(
     if books is None or books.empty:
         return pd.DataFrame()
 
-    # Content-based aggregation
-    book_scores_content: dict[str, float] = {}
-    for fav_book in favorites_list:
-        idx_list = books.index[books["title"] == fav_book].tolist()
-        if not idx_list:
-            continue
-        idx = idx_list[0]
-        sim_scores = list(enumerate(cosine_sim[idx]))
-        top_similar = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:21]
-        for i, score in top_similar:
-            title = books.iloc[i]["title"]
-            book_scores_content[title] = book_scores_content.get(title, 0.0) + float(score)
-
-    # Collaborative aggregation (nếu có)
-    book_scores_collab: dict[str, float] = {}
-    if user_book_matrix is not None and corr_mat is not None:
-        for fav_book in favorites_list:
-            collab = _collab_recs_for_book(fav_book, books, user_book_matrix, corr_mat, top_k=30)
-            if collab.empty:
-                continue
-            for _, row in collab.iterrows():
-                title = row["title"]
-                book_scores_collab[title] = book_scores_collab.get(title, 0.0) + float(row.get("corr_score", 0.0))
-
-    # Combine
-    all_titles = set(book_scores_content.keys()) | set(book_scores_collab.keys())
-    if not all_titles:
+    fav_indices = []
+    for fav in favorites_list:
+        idx = _get_idx_for_title(books, fav)
+        if idx is not None:
+            fav_indices.append(int(idx))
+    if not fav_indices:
         return pd.DataFrame()
 
-    hybrid_scores: dict[str, float] = {}
-    fav_count = max(1, len(favorites_list))
+    top_per_fav = 30
+    book_scores: dict[int, float] = {}
+    for idx in fav_indices:
+        scores = _content_scores_for_idx(idx, tfidf_matrix)
+        scores[idx] = -np.inf
+        k_eff = min(top_per_fav, scores.shape[0])
+        top_idx = np.argpartition(scores, -k_eff)[-k_eff:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        for j in top_idx:
+            book_scores[int(j)] = book_scores.get(int(j), 0.0) + float(scores[j])
 
-    for title in all_titles:
+    # Collaborative aggregation (nếu có)
+    collab_scores_by_row: dict[int, float] = {}
+    if collab_book_ids is not None and collab_item_factors is not None and "book_id" in books.columns:
+        bid_to_row = pd.Series(books.index, index=books["book_id"]).to_dict()
+        for idx in fav_indices:
+            bid = books.loc[idx].get("book_id", None)
+            pack = _collab_scores_for_book_id(bid, collab_book_ids, collab_item_factors)
+            if pack is None:
+                continue
+            all_bids, sims = pack
+            k2 = min(30, sims.shape[0])
+            top_j = np.argpartition(sims, -k2)[-k2:]
+            top_j = top_j[np.argsort(sims[top_j])[::-1]]
+            for j in top_j:
+                b = int(all_bids[j])
+                row_idx = bid_to_row.get(b)
+                if row_idx is None:
+                    continue
+                collab_scores_by_row[int(row_idx)] = collab_scores_by_row.get(int(row_idx), 0.0) + float(sims[j])
+
+    # Combine (normalize + weights)
+    fav_count = max(1, len(fav_indices))
+    all_rows = set(book_scores.keys()) | set(collab_scores_by_row.keys())
+    for idx in fav_indices:
+        all_rows.discard(int(idx))
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    hybrid_scores: dict[int, float] = {}
+    for row in all_rows:
         score = 0.0
-
-        if title in book_scores_content:
-            content_score = min(book_scores_content[title] / fav_count, 1.0)
+        if row in book_scores:
+            content_score = min(book_scores[row] / fav_count, 1.0)
             score += content_weight * content_score
-
-        if title in book_scores_collab:
-            collab_score = (book_scores_collab[title] / fav_count + 1.0) / 2.0
+        if row in collab_scores_by_row:
+            raw = collab_scores_by_row[row] / fav_count  # approx [-1,1]
+            collab_score = (raw + 1.0) / 2.0
             collab_score = max(0.0, min(1.0, collab_score))
             score += collab_weight * collab_score
+        hybrid_scores[int(row)] = score
 
-        hybrid_scores[title] = score
-
-    # loại bỏ sách đã có trong tủ
-    for fav in favorites_list:
-        hybrid_scores.pop(fav, None)
-
-    score_df = pd.DataFrame({"title": list(hybrid_scores.keys()), "hybrid_score": list(hybrid_scores.values())})
+    score_df = pd.DataFrame({"_row_idx": list(hybrid_scores.keys()), "hybrid_score": list(hybrid_scores.values())})
     score_df = score_df.sort_values("hybrid_score", ascending=False).head(max(30, top_n))
-
-    out = pd.merge(score_df, books, on="title", how="left")
+    out = books.loc[score_df["_row_idx"].values].copy()
+    out["hybrid_score"] = score_df["hybrid_score"].values
     out = filter_by_genre(out, genre)
     return out.head(top_n)
 

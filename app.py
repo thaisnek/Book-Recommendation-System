@@ -10,6 +10,7 @@ from wordcloud import WordCloud
 from sklearn.metrics.pairwise import linear_kernel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
+from scipy.sparse import coo_matrix
 from hybrid_recommendation import (
     hybrid_recommend_for_book,
     hybrid_recommend_for_favorites,
@@ -111,7 +112,7 @@ def load_data():
         st.stop()
     
     try:
-        ratings = pd.read_csv('ratings.csv')
+        ratings = pd.read_csv('ratings.csv', usecols=['userId', 'bookId', 'rating'])
         # Chuẩn hóa tên cột ratings
         if 'userId' not in ratings.columns:
             if 'user_id' in ratings.columns:
@@ -127,14 +128,13 @@ def load_data():
 
 @st.cache_resource
 def train_models(books, ratings):
-    # Content-Based: chỉ dùng TF-IDF (không dùng bert_embeddings.npy)
+    # Content-Based: TF-IDF (KHÔNG tạo cosine_sim NxN để tránh OOM khi deploy)
     tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
     tfidf_matrix = tfidf.fit_transform(books['text_features'])
-    cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
     
     # Collaborative Filtering
-    corr_mat = None
-    user_book_matrix = None
+    collab_book_ids = None
+    collab_item_factors = None
     
     if ratings is not None and len(ratings) > 0:
         try:
@@ -144,21 +144,47 @@ def train_models(books, ratings):
             if 'bookId' not in ratings.columns and 'book_id' in ratings.columns:
                 ratings = ratings.rename(columns={'book_id': 'bookId'})
             
-            if 'userId' in ratings.columns and 'bookId' in ratings.columns:
-                user_book_matrix = ratings.pivot_table(
-                    index='userId', columns='bookId', values='rating'
-                ).fillna(0)
-                
-                if user_book_matrix.shape[0] > 0 and user_book_matrix.shape[1] > 0:
-                    SVD = TruncatedSVD(n_components=50, random_state=42)
-                    matrix_reduced = SVD.fit_transform(user_book_matrix.T)
-                    corr_mat = np.corrcoef(matrix_reduced)
+            if 'userId' in ratings.columns and 'bookId' in ratings.columns and 'rating' in ratings.columns:
+                # Filter ratings to books existing in books dataset
+                if 'book_id' in books.columns:
+                    valid_book_ids = set(books['book_id'].dropna().astype(int).unique().tolist())
+                    ratings = ratings[ratings['bookId'].astype(int).isin(valid_book_ids)]
+
+                # Reduce to top users/books to avoid huge matrices on Streamlit Cloud
+                MAX_USERS = 4000
+                MAX_BOOKS = 4000
+                top_users = ratings['userId'].value_counts().head(MAX_USERS).index
+                ratings_small = ratings[ratings['userId'].isin(top_users)]
+                top_books = ratings_small['bookId'].value_counts().head(MAX_BOOKS).index
+                ratings_small = ratings_small[ratings_small['bookId'].isin(top_books)].copy()
+
+                if not ratings_small.empty:
+                    user_ids = ratings_small['userId'].drop_duplicates().tolist()
+                    book_ids = ratings_small['bookId'].drop_duplicates().tolist()
+
+                    user_id_to_row = {u: i for i, u in enumerate(user_ids)}
+                    book_id_to_col = {b: i for i, b in enumerate(book_ids)}
+
+                    rows = ratings_small['userId'].map(user_id_to_row).to_numpy()
+                    cols = ratings_small['bookId'].map(book_id_to_col).to_numpy()
+                    data = ratings_small['rating'].astype(np.float32).to_numpy()
+
+                    X = coo_matrix((data, (rows, cols)), shape=(len(user_ids), len(book_ids))).tocsr()
+
+                    n_comp_eff = min(50, min(X.shape) - 1) if min(X.shape) > 1 else 1
+                    if n_comp_eff >= 1 and X.shape[0] > 1 and X.shape[1] > 1:
+                        svd = TruncatedSVD(n_components=n_comp_eff, random_state=42)
+                        item_factors = svd.fit_transform(X.T)  # (n_books, k)
+                        norms = np.linalg.norm(item_factors, axis=1, keepdims=True)
+                        norms = np.where(norms == 0, 1.0, norms)
+                        collab_item_factors = (item_factors / norms).astype(np.float32, copy=False)
+                        collab_book_ids = np.array(book_ids, dtype=np.int64)
         except Exception as e:
             st.warning(f"Không thể tạo Collaborative Filtering: {e}")
-            user_book_matrix = None
-            corr_mat = None
+            collab_book_ids = None
+            collab_item_factors = None
     
-    return cosine_sim, user_book_matrix, corr_mat
+    return tfidf_matrix, collab_book_ids, collab_item_factors
 
 try:
     books, ratings = load_data()
@@ -167,7 +193,7 @@ try:
         st.stop()
     if st.session_state['selected_book_title'] == '':
         st.session_state['selected_book_title'] = books['title'].values[0]
-    cosine_sim, user_book_matrix, corr_mat = train_models(books, ratings)
+    tfidf_matrix, collab_book_ids, collab_item_factors = train_models(books, ratings)
 except (IndexError, KeyError) as e:
     st.error(f"❌ Lỗi cấu trúc dữ liệu: {e}")
     st.info("👉 Vui lòng chạy lại file '1_data_collection.py' và '2_data_cleaning_eda.py'")
@@ -331,9 +357,9 @@ if page == "🏠 Trang chủ":
                 aggregated_recs = hybrid_recommend_for_favorites(
                     favorites_list=fav_list,
                     books=books,
-                    cosine_sim=cosine_sim,
-                    user_book_matrix=user_book_matrix, 
-                    corr_mat=corr_mat,
+                    tfidf_matrix=tfidf_matrix,
+                    collab_book_ids=collab_book_ids,
+                    collab_item_factors=collab_item_factors,
                     genre=selected_genre,
                     top_n=12,
                 )
@@ -493,9 +519,9 @@ if page == "🏠 Trang chủ":
             res = hybrid_recommend_for_book(
                 book_title=target_book,
                 books=books,
-                cosine_sim=cosine_sim,
-                user_book_matrix=user_book_matrix,
-                corr_mat=corr_mat,
+                tfidf_matrix=tfidf_matrix,
+                collab_book_ids=collab_book_ids,
+                collab_item_factors=collab_item_factors,
                 genre=selected_genre,
                 top_n=10,
             )
