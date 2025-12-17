@@ -7,7 +7,7 @@ import html
 import matplotlib.pyplot as plt
 import seaborn as sns
 from wordcloud import WordCloud
-from sklearn.metrics.pairwise import cosine_similarity, linear_kernel
+from sklearn.metrics.pairwise import linear_kernel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from hybrid_recommendation import (
@@ -127,18 +127,10 @@ def load_data():
 
 @st.cache_resource
 def train_models(books, ratings):
-    # Content-Based với TF-IDF
-    try:
-        bert_matrix = np.load('bert_embeddings.npy')
-        if bert_matrix.shape[0] != len(books):
-            raise ValueError("BERT embeddings không khớp với số lượng sách")
-        cosine_sim = cosine_similarity(bert_matrix, bert_matrix)
-        st.success("✅ Đã sử dụng BERT embeddings")
-    except (FileNotFoundError, ValueError, OSError) as e:
-        st.info(f"ℹ️ Sử dụng TF-IDF (BERT không khả dụng: {e})")
-        tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
-        tfidf_matrix = tfidf.fit_transform(books['text_features'])
-        cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
+    # Content-Based: luôn dùng TF-IDF (không dùng bert_embeddings.npy)
+    tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
+    tfidf_matrix = tfidf.fit_transform(books['text_features'])
+    cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
     
     # Collaborative Filtering
     corr_mat = None
